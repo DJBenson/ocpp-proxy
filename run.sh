@@ -73,4 +73,4 @@ else
     exit 1
 fi
 
-exec python3 /app/proxy.py "${ARGS[@]}"
+exec python3 /app/ocpp-proxy.py "${ARGS[@]}"

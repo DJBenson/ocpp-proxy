@@ -1,12 +1,13 @@
-name: "GivEnergy OCPP Proxy"
+name: "OCPP Proxy"
 description: >
-  OCPP WebSocket proxy and charger simulator for sniffing/debugging GivEnergy
-  charger traffic. Supports two modes: proxy (transparent OCPP proxy between
-  your charger and the GivEnergy cloud) and simulate (fake charger that connects
-  to the upstream and logs any portal-initiated commands).
+  OCPP WebSocket proxy and charger simulator. Supports three modes: proxy
+  (transparent OCPP proxy between your charger and the upstream server),
+  masquerade (proxy that rewrites BootNotification identity fields), and
+  simulate (fake charger that connects to the upstream and logs any
+  portal-initiated commands).
 version: "1.0.0"
-slug: givenergy_ocpp_proxy
-url: "https://github.com/DJBenson/GivEVC-OCPP"
+slug: ocpp_proxy
+url: "https://github.com/DJBenson/ocpp-proxy"
 init: false
 arch:
   - aarch64
@@ -15,7 +16,7 @@ arch:
 
 options:
   mode: "proxy"
-  upstream: "wss://ev.comms.givenergy.cloud:7655"
+  upstream: ""
   verbose: false
   # proxy / masquerade mode options
   host: "0.0.0.0"
@@ -26,15 +27,15 @@ options:
   upstream_password: ""
   upstream_charge_point_id: ""
   # masquerade mode options (leave blank to keep the real charger's value)
-  masquerade_vendor: "Wall Box Chargers"
-  masquerade_model: "PLP2-0-2-2"
-  masquerade_firmware: "6.11.16"
+  masquerade_vendor: ""
+  masquerade_model: ""
+  masquerade_firmware: ""
   masquerade_serial: ""
   # simulate mode options
   charge_point_id: ""
-  vendor: "WWWW"
-  model: "SingleSocketCharger"
-  firmware: "AC_GL1_1.14"
+  vendor: ""
+  model: ""
+  firmware: ""
   serial: ""
 
 schema:

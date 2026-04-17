@@ -4,7 +4,7 @@ FROM $BUILD_FROM
 RUN pip3 install --no-cache-dir "aiohttp>=3.9"
 
 WORKDIR /app
-COPY proxy.py .
+COPY ocpp-proxy.py .
 COPY run.sh .
 RUN chmod +x run.sh
 
