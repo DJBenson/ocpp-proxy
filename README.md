@@ -1,3 +1,9 @@
+## 💖 Support this project
+
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-pink?logo=github)](https://github.com/sponsors/DJBenson)
+[![Ko-fi](https://img.shields.io/badge/Support-Ko--fi-ff5f5f?logo=ko-fi)](https://ko-fi.com/djbenson)
+[![PayPal](https://img.shields.io/badge/Donate-PayPal-blue?logo=paypal)](https://paypal.me/jonathanthomson81)
+
 # ocpp-proxy
 
 A WebSocket proxy and charger simulator for OCPP 1.6 traffic. Useful for understanding what your charger is sending to the cloud, testing integrations against a fake charger, or spoofing charger identity to a different OCPP backend.
