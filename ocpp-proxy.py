@@ -51,6 +51,8 @@ import asyncio
 from dataclasses import dataclass
 import json
 import logging
+import math
+import socket
 import ssl
 import sys
 from datetime import UTC, datetime
@@ -456,10 +458,11 @@ def _decode_charge_rate(value: str | int | float) -> float:
 class ChargerSimulator:
     """Stateful fake charger that behaves enough like a real device for testing."""
 
-    def __init__(self, upstream: str, config: SimulatedChargerConfig) -> None:
+    def __init__(self, upstream: str, config: SimulatedChargerConfig, password: str | None = None) -> None:
         self.config = config
         self.upstream = upstream.rstrip("/") + f"/{config.charge_point_id}"
         self.charge_point_id = config.charge_point_id
+        self.password = password
         self.state = SimulatedChargerState(
             current_limit_a=config.initial_current_limit_a,
             max_import_current_a=config.max_import_current_a,
@@ -472,23 +475,46 @@ class ChargerSimulator:
         self._heartbeat_task: asyncio.Task | None = None
         self._meter_task: asyncio.Task | None = None
         self._next_transaction_id = 1000
+        self._current_firmware: str = config.firmware
+        self._pending_firmware_version: str | None = None
 
     async def run(self) -> None:
-        """Run one charger simulation until the server closes the connection."""
+        """Run one charger simulation, reconnecting after firmware reboots."""
 
         if self.config.connect_delay_seconds > 0:
             await asyncio.sleep(self.config.connect_delay_seconds)
 
+        while True:
+            await self._run_once()
+            if self._pending_firmware_version:
+                self._current_firmware = self._pending_firmware_version
+                self._pending_firmware_version = None
+                _LOGGER.info("[%s] Reconnecting with firmware %s", self.charge_point_id, self._current_firmware)
+                await asyncio.sleep(3)
+            else:
+                break
+
+    async def _run_once(self) -> None:
+        """Run one connection session."""
+
         upstream_ssl: ssl.SSLContext | bool = (
             ssl.create_default_context() if self.upstream.startswith("wss://") else False
         )
+
+        upstream_url = self.upstream
+        if self.password:
+            parsed = urlparse(upstream_url)
+            authed_netloc = f"{self.charge_point_id}:{self.password}@{parsed.hostname}"
+            if parsed.port:
+                authed_netloc += f":{parsed.port}"
+            upstream_url = urlunparse(parsed._replace(netloc=authed_netloc))
 
         _LOGGER.info("[%s] Connecting to %s", self.charge_point_id, self.upstream)
 
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.ws_connect(
-                    self.upstream,
+                    upstream_url,
                     protocols=(OCPP_SUBPROTOCOL,),
                     ssl=upstream_ssl,
                 ) as ws:
@@ -525,7 +551,8 @@ class ChargerSimulator:
     async def _boot_sequence(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Bring the fake charger online."""
 
-        boot_response = await self._call(ws, "BootNotification", self.config.boot_payload)
+        boot_payload = {**self.config.boot_payload, "firmwareVersion": self._current_firmware}
+        boot_response = await self._call(ws, "BootNotification", boot_payload)
         _verbose("[%s] BootNotification accepted: %s", self.charge_point_id, boot_response)
 
         if isinstance(boot_response, dict):
@@ -775,14 +802,122 @@ class ChargerSimulator:
         post_stop_status = "Preparing" if self.state.plugged_in else "Available"
         await self._send_status_notification(ws, 1, post_stop_status)
 
-    async def _simulate_firmware_update(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        """Emit a simple firmware status sequence."""
+    async def _simulate_firmware_update(
+        self, ws: aiohttp.ClientWebSocketResponse, location: str | None = None
+    ) -> None:
+        """Perform a full firmware update: FTP download then reboot with new version."""
+        # Derive host, port, path from the ftp:// URL
+        host: str | None = None
+        port: int = 9688
+        filename: str | None = None
+        new_version: str | None = None
 
-        for status in ("Downloading", "Downloaded", "Installing", "Installed"):
-            self.state.firmware_status = status
-            await self._call(ws, "FirmwareStatusNotification", {"status": status})
-            await asyncio.sleep(1)
-        self.state.firmware_status = "Idle"
+        if location:
+            # ftp://host:port/path/filename
+            loc = location
+            if loc.startswith("ftp://"):
+                loc = loc[6:]
+            netloc, _, path = loc.partition("/")
+            if ":" in netloc:
+                h, _, p = netloc.partition(":")
+                host = h or None
+                try:
+                    port = int(p)
+                except ValueError:
+                    pass
+            else:
+                host = netloc or None
+            filename = path.rsplit("/", 1)[-1] if path else None
+            if filename:
+                bare = filename
+                for ext in (".bin", ".tar.gz", ".tar", ".gz", ".zip"):
+                    if bare.lower().endswith(ext):
+                        bare = bare[: -len(ext)]
+                        break
+                new_version = bare or None
+
+        await self._call(ws, "FirmwareStatusNotification", {"status": "Downloading"})
+
+        if host and filename:
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, self._do_ftp_download, host, port, filename
+                )
+                _LOGGER.info("[%s] Firmware download complete: %s", self.charge_point_id, filename)
+            except Exception as err:
+                _LOGGER.error("[%s] Firmware download failed: %s", self.charge_point_id, err)
+                await self._call(ws, "FirmwareStatusNotification", {"status": "DownloadFailed"})
+                return
+        else:
+            _LOGGER.warning("[%s] No FTP location — skipping download", self.charge_point_id)
+            await asyncio.sleep(2)
+
+        await self._call(ws, "FirmwareStatusNotification", {"status": "Downloaded"})
+        await asyncio.sleep(1)
+        await self._call(ws, "FirmwareStatusNotification", {"status": "Installing"})
+        await asyncio.sleep(2)
+        await self._call(ws, "FirmwareStatusNotification", {"status": "Installed"})
+        await asyncio.sleep(1)
+
+        if new_version:
+            self._pending_firmware_version = new_version
+        _LOGGER.info("[%s] Firmware update complete — rebooting (new version: %s)", self.charge_point_id, new_version or "unknown")
+        await ws.close()
+
+    def _do_ftp_download(self, host: str, port: int, filename: str) -> None:
+        """Perform the GivEnergy chunked TCP firmware download (blocking, runs in executor)."""
+        PACK_LEN = 4096
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(30)
+        try:
+            sock.connect((host, port))
+            # Send download request
+            request = json.dumps({"filename": filename, "packlen": str(PACK_LEN)}, separators=(",", ":")).encode()
+            sock.sendall(request)
+
+            # Read server response: {"res":"ok","filesize":"N","packnum":"N","checksum":"N"}
+            buf = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise RuntimeError("Connection closed before server response")
+                buf += chunk
+                try:
+                    response = json.loads(buf.decode("utf-8", errors="replace"))
+                    break
+                except json.JSONDecodeError:
+                    continue
+
+            if response.get("res") != "ok":
+                raise RuntimeError(f"Server rejected download: {response}")
+
+            pack_num = int(response["packnum"])
+            file_size = int(response["filesize"])
+            pack_len = PACK_LEN
+            _LOGGER.info("[%s] Downloading %s: %s chunks (%s bytes)", self.charge_point_id, filename, pack_num, file_size)
+
+            received = bytearray()
+            for pack_sn in range(pack_num):
+                # Request next chunk
+                req = json.dumps({"packsn": pack_sn}, separators=(",", ":")).encode()
+                sock.sendall(req)
+                # Last chunk may be smaller than pack_len
+                expected = min(pack_len, file_size - pack_sn * pack_len)
+                remaining = expected
+                while remaining > 0:
+                    data = sock.recv(remaining)
+                    if not data:
+                        break
+                    received += data
+                    remaining -= len(data)
+
+            # Send checksum acknowledgement and close
+            sock.sendall(json.dumps({"checksum": "ok"}, separators=(",", ":")).encode())
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     async def _handle_trigger_follow_up(
         self, ws: aiohttp.ClientWebSocketResponse, requested_message: str | None
@@ -895,7 +1030,7 @@ class ChargerSimulator:
             return {"status": "Accepted"}
 
         if action == "UpdateFirmware":
-            asyncio.create_task(self._simulate_firmware_update(ws))
+            asyncio.create_task(self._simulate_firmware_update(ws, location=payload.get("location")))
             return {}
 
         if action == "Reset":
@@ -1078,7 +1213,8 @@ async def _run_proxy(args: argparse.Namespace, masquerade: dict[str, str] | None
 
 async def _run_simulate(args: argparse.Namespace) -> None:
     configs = _load_simulator_configs(args)
-    simulators = [ChargerSimulator(args.upstream, config) for config in configs]
+    password = getattr(args, "upstream_password", None) or None
+    simulators = [ChargerSimulator(args.upstream, config, password=password) for config in configs]
 
     if len(simulators) == 1:
         _LOGGER.info("Starting 1 simulated charger")
@@ -1141,6 +1277,7 @@ def main() -> None:
     sim_parser.add_argument("--voltage", type=float, default=230.0, help="Nominal line voltage for generated MeterValues")
     sim_parser.add_argument("--remote-id-tag", default="SIM-REMOTE", help="Default idTag used for RemoteStartTransaction")
     sim_parser.add_argument("--plugged-in", action="store_true", help="Boot with connector in Preparing state (car already plugged in)")
+    sim_parser.add_argument("--upstream-password", default=None, help="Password for upstream basic auth")
 
     args = parser.parse_args()
     _VERBOSE = args.verbose
