@@ -687,7 +687,11 @@ class ChargerSimulator:
             },
         )
 
-    async def _send_meter_values(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+    async def _send_meter_values(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        elapsed_seconds: float | None = None,
+    ) -> None:
         """Send a realistic MeterValues frame."""
 
         charging = self.state.transaction_active
@@ -695,44 +699,73 @@ class ChargerSimulator:
         current_a = self.state.current_limit_a if charging else 0.0
 
         if charging:
-            delta_wh = power_w * (self.state.meter_value_sample_interval_seconds / 3600)
-            self.state.total_energy_wh = round(self.state.total_energy_wh + delta_wh, 3)
+            sample_seconds = (
+                self.state.meter_value_sample_interval_seconds
+                if elapsed_seconds is None
+                else elapsed_seconds
+            )
+            if sample_seconds > 0:
+                delta_wh = power_w * (sample_seconds / 3600)
+                self.state.total_energy_wh = round(self.state.total_energy_wh + delta_wh, 3)
+
+        sampled_values = [
+            {
+                "value": f"{self.state.total_energy_wh:.0f}",
+                "context": "Sample.Periodic",
+                "format": "Raw",
+                "measurand": "Energy.Active.Import.Register",
+                "location": "Outlet",
+                "unit": "Wh",
+            }
+        ]
+        if charging:
+            sampled_values.extend(
+                [
+                    {
+                        "value": f"{power_w:.1f}",
+                        "context": "Sample.Periodic",
+                        "format": "Raw",
+                        "measurand": "Power.Active.Import",
+                        "location": "Outlet",
+                        "unit": "W",
+                    },
+                    {
+                        "value": f"{current_a:.1f}",
+                        "context": "Sample.Periodic",
+                        "format": "Raw",
+                        "measurand": "Current.Import",
+                        "location": "Outlet",
+                        "unit": "A",
+                    },
+                    {
+                        "value": f"{self.config.voltage_v:.1f}",
+                        "context": "Sample.Periodic",
+                        "format": "Raw",
+                        "measurand": "Voltage",
+                        "location": "Outlet",
+                        "unit": "V",
+                    },
+                ]
+            )
+
+        payload: dict[str, object] = {
+            "connectorId": 1,
+            "meterValue": [
+                {
+                    "timestamp": datetime.now(UTC).replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "sampledValue": sampled_values,
+                }
+            ],
+        }
+        if charging and self.state.transaction_id is not None:
+            payload["transactionId"] = self.state.transaction_id
 
         await self._call(
             ws,
             "MeterValues",
-            {
-                "connectorId": 1,
-                "meterValue": [
-                    {
-                        "timestamp": datetime.now(UTC).replace(microsecond=0)
-                        .isoformat()
-                        .replace("+00:00", "Z"),
-                        "sampledValue": [
-                            {
-                                "value": f"{self.state.total_energy_wh:.0f}",
-                                "measurand": "Energy.Active.Import.Register",
-                                "unit": "Wh",
-                            },
-                            {
-                                "value": f"{power_w:.1f}",
-                                "measurand": "Power.Active.Import",
-                                "unit": "W",
-                            },
-                            {
-                                "value": f"{current_a:.1f}",
-                                "measurand": "Current.Import",
-                                "unit": "A",
-                            },
-                            {
-                                "value": f"{self.config.voltage_v:.1f}",
-                                "measurand": "Voltage",
-                                "unit": "V",
-                            },
-                        ],
-                    }
-                ],
-            },
+            payload,
         )
 
     async def _start_transaction(self, ws: aiohttp.ClientWebSocketResponse, id_tag: str) -> None:
@@ -765,6 +798,7 @@ class ChargerSimulator:
             self.state.transaction_id = int(response["transactionId"])
 
         await self._send_status_notification(ws, 1, "Charging")
+        await self._send_meter_values(ws, elapsed_seconds=0)
         if self._meter_task is None or self._meter_task.done():
             self._meter_task = asyncio.create_task(self._meter_loop(ws))
 

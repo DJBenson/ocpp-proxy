@@ -4,7 +4,7 @@
   "model": "DDDD",
   "firmware": "AC_GL1_1.12",
   "serial": "9876543210",
-  "heartbeat_interval_seconds": "300",
+  "heartbeat_interval_seconds": "60",
   "meter_value_sample_interval_seconds": "15",
   "current_limit_a": "32.0",
   "max_import_current_a": "80",
